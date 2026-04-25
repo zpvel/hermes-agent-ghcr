@@ -3,7 +3,11 @@ name: Build and Publish GHCR
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - ".github/workflows/ghcr-publish.yml"
   workflow_dispatch:
+  schedule:
+    - cron: "17 20 * * *"
 
 permissions:
   contents: read
@@ -25,7 +29,11 @@ jobs:
       should_build: ${{ steps.plan.outputs.should_build }}
       build_reason: ${{ steps.plan.outputs.build_reason }}
       upstream_digest: ${{ steps.plan.outputs.upstream_digest }}
+      upstream_version: ${{ steps.plan.outputs.upstream_version }}
+      upstream_release_date: ${{ steps.plan.outputs.upstream_release_date }}
       current_base_digest: ${{ steps.plan.outputs.current_base_digest }}
+      current_upstream_version: ${{ steps.plan.outputs.current_upstream_version }}
+      current_upstream_release_date: ${{ steps.plan.outputs.current_upstream_release_date }}
 
     steps:
       - name: Log In To GHCR
@@ -57,22 +65,45 @@ jobs:
             exit 1
           fi
           upstream_digest="${upstream_repo_digest#*@}"
+          extract_version() {
+            docker run --rm --entrypoint /opt/hermes/.venv/bin/python3 "$1" -c 'from hermes_cli import __version__, __release_date__; print(f"{__version__}|{__release_date__}")' 2>/dev/null || true
+          }
+          upstream_version_pair="$(extract_version "${BASE_IMAGE}")"
+          upstream_version="${upstream_version_pair%%|*}"
+          upstream_release_date="${upstream_version_pair#*|}"
+          if [[ "${upstream_version_pair}" != *"|"* ]]; then
+            upstream_version=""
+            upstream_release_date=""
+          fi
 
           current_base_digest=""
+          current_upstream_version=""
+          current_upstream_release_date=""
           current_image="${REGISTRY}/${IMAGE_NAME}:latest"
           if docker pull "${current_image}" >/dev/null 2>&1; then
             current_base_digest="$(docker image inspect "${current_image}" --format '{{ index .Config.Labels "org.opencontainers.image.base.digest" }}' || true)"
+            current_upstream_version_pair="$(extract_version "${current_image}")"
+            current_upstream_version="${current_upstream_version_pair%%|*}"
+            current_upstream_release_date="${current_upstream_version_pair#*|}"
+            if [[ "${current_upstream_version_pair}" != *"|"* ]]; then
+              current_upstream_version=""
+              current_upstream_release_date=""
+            fi
           fi
 
           if [[ "${GITHUB_EVENT_NAME}" == "schedule" ]]; then
-            if [[ -z "${current_base_digest}" ]]; then
+            if [[ -n "${upstream_version}" && -n "${current_upstream_version}" ]]; then
+              if [[ "${current_upstream_version}|${current_upstream_release_date}" != "${upstream_version}|${upstream_release_date}" ]]; then
+                should_build=true
+                build_reason="schedule:upstream-version-changed"
+              else
+                build_reason="schedule:no-upstream-version-change"
+              fi
+            elif [[ -z "${current_base_digest}" ]]; then
               should_build=true
               build_reason="schedule:missing-current-base-digest"
-            elif [[ "${current_base_digest}" != "${upstream_digest}" ]]; then
-              should_build=true
-              build_reason="schedule:upstream-changed"
             else
-              build_reason="schedule:no-upstream-change"
+              build_reason="schedule:version-check-unavailable"
             fi
           fi
 
@@ -80,7 +111,11 @@ jobs:
             echo "should_build=${should_build}"
             echo "build_reason=${build_reason}"
             echo "upstream_digest=${upstream_digest}"
+            echo "upstream_version=${upstream_version}"
+            echo "upstream_release_date=${upstream_release_date}"
             echo "current_base_digest=${current_base_digest}"
+            echo "current_upstream_version=${current_upstream_version}"
+            echo "current_upstream_release_date=${current_upstream_release_date}"
           } >> "${GITHUB_OUTPUT}"
 
       - name: Build Decision Summary
@@ -92,10 +127,20 @@ jobs:
             echo "- event: \`${GITHUB_EVENT_NAME}\`"
             echo "- reason: \`${{ steps.plan.outputs.build_reason }}\`"
             echo "- upstream digest: \`${{ steps.plan.outputs.upstream_digest }}\`"
+            if [[ -n "${{ steps.plan.outputs.upstream_version }}" ]]; then
+              echo "- upstream version: \`${{ steps.plan.outputs.upstream_version }} (${{ steps.plan.outputs.upstream_release_date }})\`"
+            else
+              echo "- upstream version: \`(missing)\`"
+            fi
             if [[ -n "${{ steps.plan.outputs.current_base_digest }}" ]]; then
               echo "- current custom image base digest: \`${{ steps.plan.outputs.current_base_digest }}\`"
             else
               echo "- current custom image base digest: \`(missing)\`"
+            fi
+            if [[ -n "${{ steps.plan.outputs.current_upstream_version }}" ]]; then
+              echo "- current custom image upstream version: \`${{ steps.plan.outputs.current_upstream_version }} (${{ steps.plan.outputs.current_upstream_release_date }})\`"
+            else
+              echo "- current custom image upstream version: \`(missing)\`"
             fi
             echo "- should build: \`${{ steps.plan.outputs.should_build }}\`"
           } >> "${GITHUB_STEP_SUMMARY}"
@@ -122,6 +167,8 @@ jobs:
           labels: |
             org.opencontainers.image.base.name=${{ env.BASE_IMAGE }}
             org.opencontainers.image.base.digest=${{ needs.plan.outputs.upstream_digest }}
+            org.opencontainers.image.upstream.version=${{ needs.plan.outputs.upstream_version }}
+            org.opencontainers.image.upstream.release_date=${{ needs.plan.outputs.upstream_release_date }}
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
             type=sha,prefix=sha-
@@ -177,5 +224,6 @@ jobs:
             echo ""
             echo "- reason: \`${{ needs.plan.outputs.build_reason }}\`"
             echo "- upstream digest: \`${{ needs.plan.outputs.upstream_digest }}\`"
+            echo "- upstream version: \`${{ needs.plan.outputs.upstream_version }} (${{ needs.plan.outputs.upstream_release_date }})\`"
             echo "- published image: \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest\`"
           } >> "${GITHUB_STEP_SUMMARY}"
