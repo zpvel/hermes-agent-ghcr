@@ -569,6 +569,13 @@ class QQAdapter(BasePlatformAdapter):
             await self._ensure_token()
             gateway_url = await self._get_gateway_url()
             await self._open_ws(gateway_url)
+            if self._heartbeat_task:
+                self._heartbeat_task.cancel()
+                try:
+                    await self._heartbeat_task
+                except asyncio.CancelledError:
+                    pass
+            self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
             self._mark_connected()
             logger.info("[%s] Reconnected", self._log_tag)
             return True
