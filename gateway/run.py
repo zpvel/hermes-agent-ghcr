@@ -1564,20 +1564,41 @@ class GatewayRunner:
             return True
 
         # --- Normal busy case (agent actively running a task) ---
-        # The user sent a message while the agent is working.  Interrupt the
-        # agent immediately so it stops the current tool-calling loop and
-        # processes the new message.  The pending message is stored in the
-        # adapter so the base adapter picks it up once the interrupted run
-        # returns.  A brief ack tells the user what's happening (debounced
-        # to avoid spam when they fire multiple messages quickly).
+        # The configured busy-input mode decides whether follow-up messages
+        # wait for the next turn or interrupt the active run.
 
         adapter = self.adapters.get(event.source.platform)
         if not adapter:
             return False  # let default path handle it
 
+        from gateway.platforms.base import merge_pending_message_event
+        if self._busy_input_mode == "queue":
+            merge_pending_message_event(
+                adapter._pending_messages, session_key, event, merge_text=True
+            )
+
+            _BUSY_ACK_COOLDOWN = 30
+            now = time.time()
+            last_ack = self._busy_ack_ts.get(session_key, 0)
+            if now - last_ack < _BUSY_ACK_COOLDOWN:
+                return True
+
+            self._busy_ack_ts[session_key] = now
+            thread_meta = {"thread_id": event.source.thread_id} if event.source.thread_id else None
+            try:
+                await adapter._send_with_retry(
+                    chat_id=event.source.chat_id,
+                    content="📩 已排队，当前任务完成后自动处理。",
+                    reply_to=event.message_id,
+                    metadata=thread_meta,
+                )
+            except Exception as e:
+                logger.debug("Failed to send queue-ack: %s", e)
+
+            return True
+
         # Store the message so it's processed as the next turn after the
         # interrupt causes the current run to exit.
-        from gateway.platforms.base import merge_pending_message_event
         merge_pending_message_event(adapter._pending_messages, session_key, event)
 
         # Interrupt the running agent — this aborts in-flight tool calls and
@@ -2176,7 +2197,7 @@ class GatewayRunner:
         # Build initial channel directory for send_message name resolution
         try:
             from gateway.channel_directory import build_channel_directory
-            directory = build_channel_directory(self.adapters)
+            directory = await build_channel_directory(self.adapters)
             ch_count = sum(len(chs) for chs in directory.get("platforms", {}).values())
             logger.info("Channel directory built: %d target(s)", ch_count)
         except Exception as e:
@@ -2451,7 +2472,7 @@ class GatewayRunner:
                         # Rebuild channel directory with the new adapter
                         try:
                             from gateway.channel_directory import build_channel_directory
-                            build_channel_directory(self.adapters)
+                            await build_channel_directory(self.adapters)
                         except Exception:
                             pass
                     else:
@@ -3375,6 +3396,17 @@ class GatewayRunner:
                     if self._queue_during_drain_enabled()
                     else f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now."
                 )
+            if self._busy_input_mode == "queue":
+                adapter = self.adapters.get(source.platform)
+                if adapter:
+                    merge_pending_message_event(
+                        adapter._pending_messages,
+                        _quick_key,
+                        event,
+                        merge_text=True,
+                    )
+                logger.debug("Queue mode: queued message for session %s (no interrupt)", _quick_key[:20])
+                return None
             logger.debug("PRIORITY interrupt for session %s", _quick_key[:20])
             running_agent.interrupt(event.text)
             if _quick_key in self._pending_messages:
@@ -10669,7 +10701,13 @@ def _start_cron_ticker(stop_event: threading.Event, adapters=None, loop=None, in
         if tick_count % CHANNEL_DIR_EVERY == 0 and adapters:
             try:
                 from gateway.channel_directory import build_channel_directory
-                build_channel_directory(adapters)
+                if loop and loop.is_running():
+                    future = asyncio.run_coroutine_threadsafe(
+                        build_channel_directory(adapters), loop
+                    )
+                    future.result(timeout=30)
+                else:
+                    asyncio.run(build_channel_directory(adapters))
             except Exception as e:
                 logger.debug("Channel directory refresh error: %s", e)
 
