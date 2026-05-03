@@ -368,16 +368,31 @@ def _resolve_reply_model_prefix_config(user_config: dict, platform_key: str):
     ).strip()
     if "{model}" not in prefix_format:
         prefix_format = "【{model}】"
-    return enabled, prefix_format
+    model_labels = display_cfg.get("reply_model_prefix_labels", {})
+    if not isinstance(model_labels, dict):
+        model_labels = {}
+    model_labels = {
+        str(key).strip(): str(value).strip()
+        for key, value in model_labels.items()
+        if str(key).strip() and str(value).strip()
+    }
+    return enabled, prefix_format, model_labels
 
 
-def _apply_reply_model_prefix(text: str, model: str, prefix_format: str) -> str:
+def _apply_reply_model_prefix(
+    text: str,
+    model: str,
+    prefix_format: str,
+    model_labels: Optional[dict] = None,
+) -> str:
     """Prepend the resolved model ID to a reply when enabled."""
     if not isinstance(text, str):
         return text
     model_id = str(model or "").strip()
     if not text or not model_id:
         return text
+    if isinstance(model_labels, dict):
+        model_id = str(model_labels.get(model_id) or model_id).strip()
 
     try:
         prefix = prefix_format.format(model=model_id)
@@ -10344,7 +10359,11 @@ class GatewayRunner:
 
             _reply_model_prefix_applied = False
             _reply_model_prefix_rewritten = False
-            _reply_model_prefix_enabled, _reply_model_prefix_format = (
+            (
+                _reply_model_prefix_enabled,
+                _reply_model_prefix_format,
+                _reply_model_prefix_labels,
+            ) = (
                 _resolve_reply_model_prefix_config(user_config, platform_key)
             )
             _prefix_stream_consumer = stream_consumer_holder[0]
@@ -10371,6 +10390,7 @@ class GatewayRunner:
                         _current_final,
                         _resolved_model,
                         _reply_model_prefix_format,
+                        _reply_model_prefix_labels,
                     )
                     if _reply_model_prefix_enabled
                     else _current_final
