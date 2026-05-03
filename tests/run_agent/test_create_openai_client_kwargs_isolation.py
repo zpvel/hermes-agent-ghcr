@@ -12,6 +12,7 @@ function must treat its input dict as read-only.
 """
 from unittest.mock import MagicMock, patch
 
+from agent.gemini_native_adapter import GeminiNativeClient
 from run_agent import AIAgent
 
 
@@ -35,3 +36,29 @@ def test_create_openai_client_does_not_mutate_input_kwargs(mock_openai):
     assert kwargs == snapshot, (
         f"_create_openai_client mutated input kwargs; expected {snapshot}, got {kwargs}"
     )
+
+
+@patch("run_agent.OpenAI")
+def test_create_openai_client_uses_native_gemini_for_v1beta(mock_openai):
+    agent = AIAgent(
+        api_key="test-key",
+        base_url="http://127.0.0.1:3020/v1beta",
+        provider="gemini",
+        api_mode="chat_completions",
+        model="gemini-3.1-pro-preview",
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+
+    client = agent._create_openai_client(
+        {
+            "api_key": "test-key",
+            "base_url": "http://127.0.0.1:3020/v1beta",
+        },
+        reason="test",
+        shared=False,
+    )
+
+    assert isinstance(client, GeminiNativeClient)
+    assert not mock_openai.called
